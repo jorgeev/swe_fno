@@ -40,6 +40,8 @@ class Config1D:
     sched_step: int = 25
     sched_gamma: float = 0.5
 
+    gen_batch_size: int = 32    # ICs per GPU batch during dataset generation
+
     device: str = "cuda"
     out_dir: str = "runs/swe1d"
 
@@ -86,6 +88,8 @@ class Config2D:
     weight_decay: float = 1.0e-4
     sched_step: int = 25
     sched_gamma: float = 0.5
+
+    gen_batch_size: int = 16    # ICs per GPU batch during dataset generation
 
     device: str = "cuda"
     out_dir: str = "runs/swe2d"
