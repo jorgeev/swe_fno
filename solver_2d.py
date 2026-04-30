@@ -79,12 +79,14 @@ def _make_spectral_ops(ny, nx, Ly, Lx):
 # RHS / time stepping  (GPU — cupy arrays throughout)
 # --------------------------------------------------------------------------- #
 def _rhs(h, u, v, b, KX, KY, dealias, hyper, f, g, visc):
-    Hk = cp.fft.fft2(h)
-    Uk = cp.fft.fft2(u)
-    Vk = cp.fft.fft2(v)
-    Bk = cp.fft.fft2(b)
+    # axes=(-2,-1) makes this work for unbatched (ny,nx) and batched (B,ny,nx)
+    _fft2  = lambda x: cp.fft.fft2(x, axes=(-2, -1))
+    _re_ifft = lambda F: cp.real(cp.fft.ifft2(F, axes=(-2, -1)))
 
-    def _re_ifft(F): return cp.real(cp.fft.ifft2(F))
+    Hk = _fft2(h)
+    Uk = _fft2(u)
+    Vk = _fft2(v)
+    Bk = _fft2(b)
 
     dudx    = _re_ifft(1j * KX * Uk)
     dudy    = _re_ifft(1j * KY * Uk)
@@ -93,13 +95,13 @@ def _rhs(h, u, v, b, KX, KY, dealias, hyper, f, g, visc):
     deta_dx = _re_ifft(1j * KX * (Hk + Bk))
     deta_dy = _re_ifft(1j * KY * (Hk + Bk))
 
-    hu_d   = _re_ifft(cp.fft.fft2(h * u) * dealias)
-    hv_d   = _re_ifft(cp.fft.fft2(h * v) * dealias)
-    dhu_dx = _re_ifft(1j * KX * cp.fft.fft2(hu_d))
-    dhv_dy = _re_ifft(1j * KY * cp.fft.fft2(hv_d))
+    hu_d   = _re_ifft(_fft2(h * u) * dealias)
+    hv_d   = _re_ifft(_fft2(h * v) * dealias)
+    dhu_dx = _re_ifft(1j * KX * _fft2(hu_d))
+    dhv_dy = _re_ifft(1j * KY * _fft2(hv_d))
 
-    udu_vdu = _re_ifft(cp.fft.fft2(u * dudx + v * dudy) * dealias)
-    udv_vdv = _re_ifft(cp.fft.fft2(u * dvdx + v * dvdy) * dealias)
+    udu_vdu = _re_ifft(_fft2(u * dudx + v * dudy) * dealias)
+    udv_vdv = _re_ifft(_fft2(u * dvdx + v * dvdy) * dealias)
 
     dh_dt = -(dhu_dx + dhv_dy)              - visc * _re_ifft(hyper * Hk)
     du_dt = -udu_vdu + f * v - g * deta_dx  - visc * _re_ifft(hyper * Uk)
@@ -161,6 +163,98 @@ def simulate_2d(cfg, rng):
                 h=cp.asnumpy(h), u=cp.asnumpy(u), v=cp.asnumpy(v))
 
 
+def simulate_batch_2d(cfg, rng, B: int) -> list:
+    """Simulate B trajectories in parallel on GPU.
+
+    Returns a list of length B; each element is a result dict
+    {h0,u0,v0,b,f,h,u,v} (numpy arrays of shape (ny,nx), f is a float)
+    or None if that trajectory was invalid.
+    """
+    KX_np, KY_np, dealias_np, hyper_np = _make_spectral_ops(cfg.ny, cfg.nx, cfg.Ly, cfg.Lx)
+    dx = min(cfg.Lx / cfg.nx, cfg.Ly / cfg.ny)
+
+    b_list   = [make_bottom_2d(cfg, rng) for _ in range(B)]
+    huv_list = [make_initial_2d(cfg, b, rng) for b in b_list]
+    f_list   = [float(rng.uniform(cfg.f_min, cfg.f_max)) for _ in range(B)]
+
+    h0_arr = np.stack([huv[0] for huv in huv_list])  # (B, ny, nx)
+    u0_arr = np.stack([huv[1] for huv in huv_list])
+    v0_arr = np.stack([huv[2] for huv in huv_list])
+    b_arr  = np.stack(b_list)
+
+    # Conservative dt across batch
+    c_max = max(
+        float(np.sqrt(cfg.g * (cfg.H0 + cfg.bottom_amp))
+              + np.sqrt(np.maximum(huv[1], 0).max()**2 + np.maximum(huv[2], 0).max()**2)
+              + np.abs(huv[1]).max() + np.abs(huv[2]).max())
+        for huv in huv_list
+    )
+    dt = cfg.cfl * dx / max(c_max, 1e-6)
+    nt = max(int(np.ceil(cfg.T / dt)), 1)
+    dt = cfg.T / nt
+
+    h       = cp.asarray(h0_arr)                          # (B, ny, nx)
+    u       = cp.asarray(u0_arr)
+    v       = cp.asarray(v0_arr)
+    b       = cp.asarray(b_arr)
+    KX      = cp.asarray(KX_np)                           # (ny, nx) — broadcasts
+    KY      = cp.asarray(KY_np)
+    dealias = cp.asarray(dealias_np)
+    hyper   = cp.asarray(hyper_np)
+    f_gpu   = cp.asarray(np.array(f_list)).reshape(B, 1, 1)  # (B, 1, 1) for broadcast
+
+    # Run all B trajectories without per-step GPU→CPU sync
+    for _ in range(nt):
+        h, u, v = _rk4(h, u, v, b, KX, KY, dealias, hyper, dt, f_gpu, cfg.g, cfg.visc)
+
+    h_np = cp.asnumpy(h)   # single transfer
+    u_np = cp.asnumpy(u)
+    v_np = cp.asnumpy(v)
+
+    results = []
+    for i in range(B):
+        hi = h_np[i]
+        if not np.all(np.isfinite(hi)) or hi.min() <= 1e-3:
+            results.append(None)
+        else:
+            results.append(dict(h0=h0_arr[i], u0=u0_arr[i], v0=v0_arr[i],
+                                b=b_arr[i], f=f_list[i],
+                                h=hi.copy(), u=u_np[i].copy(), v=v_np[i].copy()))
+    return results
+
+
+def simulate_step_2d(cfg, h_np: np.ndarray, u_np: np.ndarray, v_np: np.ndarray,
+                     b_np: np.ndarray, f: float) -> tuple:
+    """Advance the 2D SWE by cfg.T from a given state.
+
+    Accepts float32 or float64 numpy arrays; returns numpy arrays of the same dtype.
+    No validity check — intended for video generation from a known-good state.
+    """
+    KX_np, KY_np, dealias_np, hyper_np = _make_spectral_ops(cfg.ny, cfg.nx, cfg.Ly, cfg.Lx)
+    dx = min(cfg.Lx / cfg.nx, cfg.Ly / cfg.ny)
+
+    c_max = float(np.sqrt(cfg.g * (cfg.H0 + cfg.bottom_amp))
+                  + np.sqrt(np.maximum(u_np, 0).max()**2 + np.maximum(v_np, 0).max()**2)
+                  + np.abs(u_np).max() + np.abs(v_np).max())
+    dt = cfg.cfl * dx / max(c_max, 1e-6)
+    nt = max(int(np.ceil(cfg.T / dt)), 1)
+    dt = cfg.T / nt
+
+    h       = cp.asarray(h_np)
+    u       = cp.asarray(u_np)
+    v       = cp.asarray(v_np)
+    b       = cp.asarray(b_np)
+    KX      = cp.asarray(KX_np)
+    KY      = cp.asarray(KY_np)
+    dealias = cp.asarray(dealias_np)
+    hyper   = cp.asarray(hyper_np)
+
+    for _ in range(nt):
+        h, u, v = _rk4(h, u, v, b, KX, KY, dealias, hyper, dt, f, cfg.g, cfg.visc)
+
+    return cp.asnumpy(h), cp.asnumpy(u), cp.asnumpy(v)
+
+
 def generate_dataset_2d(cfg, n_samples: int, base_seed: int = 0):
     """Generate ``n_samples`` trajectories. Returns dict of stacked numpy arrays."""
     rng    = np.random.default_rng(base_seed)
@@ -169,17 +263,24 @@ def generate_dataset_2d(cfg, n_samples: int, base_seed: int = 0):
     f_list = []
     n_done = 0
     n_try  = 0
+    B      = cfg.gen_batch_size
+    next_print = max(1, n_samples // 10)
+
     while n_done < n_samples:
-        n_try += 1
-        out = simulate_2d(cfg, rng)
-        if out is None:
-            continue
-        for k in keys:
-            fields[k].append(out[k])
-        f_list.append(out["f"])
-        n_done += 1
-        if n_done % max(1, n_samples // 10) == 0:
-            print(f"  [2D] {n_done}/{n_samples} (rejected {n_try - n_done})")
-    data      = {k: np.stack(v).astype(np.float32) for k, v in fields.items()}
-    data["f"] = np.array(f_list, dtype=np.float32)
+        for out in simulate_batch_2d(cfg, rng, B):
+            n_try += 1
+            if out is None:
+                continue
+            for k in keys:
+                fields[k].append(out[k])
+            f_list.append(out["f"])
+            n_done += 1
+            if n_done >= next_print or n_done >= n_samples:
+                print(f"  [2D] {n_done}/{n_samples} (rejected {n_try - n_done})")
+                next_print += max(1, n_samples // 10)
+            if n_done >= n_samples:
+                break
+
+    data      = {k: np.stack(v[:n_samples]).astype(np.float32) for k, v in fields.items()}
+    data["f"] = np.array(f_list[:n_samples], dtype=np.float32)
     return data
