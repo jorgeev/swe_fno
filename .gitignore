@@ -1,7 +1,11 @@
 *.pyc
 __pycache__/
 runs/
+logs/
 
 .DS_Store
 .env
 CLAUDE.md
+
+# Slurm task files
+*.slurm
